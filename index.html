@@ -1,0 +1,542 @@
+<script type="text/javascript">
+        var gk_isXlsx = false;
+        var gk_xlsxFileLookup = {};
+        var gk_fileData = {};
+        function filledCell(cell) {
+          return cell !== '' && cell != null;
+        }
+        function loadFileData(filename) {
+        if (gk_isXlsx && gk_xlsxFileLookup[filename]) {
+            try {
+                var workbook = XLSX.read(gk_fileData[filename], { type: 'base64' });
+                var firstSheetName = workbook.SheetNames[0];
+                var worksheet = workbook.Sheets[firstSheetName];
+
+                // Convert sheet to JSON to filter blank rows
+                var jsonData = XLSX.utils.sheet_to_json(worksheet, { header: 1, blankrows: false, defval: '' });
+                // Filter out blank rows (rows where all cells are empty, null, or undefined)
+                var filteredData = jsonData.filter(row => row.some(filledCell));
+
+                // Heuristic to find the header row by ignoring rows with fewer filled cells than the next row
+                var headerRowIndex = filteredData.findIndex((row, index) =>
+                  row.filter(filledCell).length >= filteredData[index + 1]?.filter(filledCell).length
+                );
+                // Fallback
+                if (headerRowIndex === -1 || headerRowIndex > 25) {
+                  headerRowIndex = 0;
+                }
+
+                // Convert filtered JSON back to CSV
+                var csv = XLSX.utils.aoa_to_sheet(filteredData.slice(headerRowIndex)); // Create a new sheet from filtered array of arrays
+                csv = XLSX.utils.sheet_to_csv(csv, { header: 1 });
+                return csv;
+            } catch (e) {
+                console.error(e);
+                return "";
+            }
+        }
+        return gk_fileData[filename] || "";
+        }
+        </script><!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Gap & Overlap Checker</title>
+    <!-- Bootstrap CSS -->
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <!-- Leaflet CSS -->
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <style>
+        #map { height: 600px; }
+        .info-panel { padding: 15px; }
+        .error-table-container { max-height: 200px; overflow-y: auto; }
+        .zoom-btn { cursor: pointer; }
+        .circle-number {
+            background: white;
+            border: 2px solid black;
+            border-radius: 50%;
+            width: 24px;
+            height: 24px;
+            text-align: center;
+            line-height: 20px;
+            font-size: 12px;
+            font-weight: bold;
+        }
+    </style>
+</head>
+<body>
+    <div class="container-fluid">
+        <h1 class="my-4">Gap & Overlap Checker</h1>
+        <div class="row">
+            <div class="col-md-8">
+                <div id="map"></div>
+            </div>
+            <div class="col-md-4">
+                <div class="info-panel">
+                    <h4>Upload Files</h4>
+                    <div class="mb-3">
+                        <label for="file1" class="form-label">First File (.geojson, .json, or .zip)</label>
+                        <input type="file" class="form-control" id="file1" accept=".geojson,.json,.zip">
+                    </div>
+                    <div class="mb-3">
+                        <label for="file2" class="form-label">Second File (.geojson, .json, or .zip)</label>
+                        <input type="file" class="form-control" id="file2" accept=".geojson,.json,.zip">
+                    </div>
+                    <div class="mb-3">
+                        <label for="basemap" class="form-label">Basemap</label>
+                        <select id="basemap" class="form-select">
+                            <option value="osm">OpenStreetMap</option>
+                            <option value="esri">Esri Satellite Imagery</option>
+                        </select>
+                    </div>
+                    <div class="mb-3">
+                        <div class="form-check">
+                            <input type="checkbox" class="form-check-input" id="toggleMarkers" checked>
+                            <label class="form-check-label" for="toggleMarkers">Show Markers</label>
+                        </div>
+                    </div>
+                    <button id="checkTopology" class="btn btn-success mb-2" disabled>Check Topology</button>
+                    <button id="clearMap" class="btn btn-secondary mb-2">Clear Map</button>
+                </div>
+            </div>
+        </div>
+        <!-- New row for the error table -->
+        <div class="row">
+            <div class="col-12">
+                <h4>Topology Errors</h4>
+                <div class="error-table-container">
+                    <table id="errorTable" class="table table-striped table-bordered">
+                        <thead>
+                            <tr>
+                                <th>#</th>
+                                <th>Error</th>
+                                <th>Area (sq m)</th>
+                                <th>Action</th>
+                            </tr>
+                        </thead>
+                        <tbody id="errorTableBody"></tbody>
+                    </table>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Leaflet JS -->
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <!-- Turf.js -->
+    <script src="https://cdn.jsdelivr.net/npm/@turf/turf@6/turf.min.js"></script>
+    <!-- shpjs -->
+    <script src="https://unpkg.com/shpjs@0.4.2/dist/shp.min.js"></script>
+    <!-- Bootstrap JS -->
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+
+    <script>
+        // Initialize map
+        const map = L.map('map').setView([51.505, -0.09], 13);
+
+        // Basemap layers
+        const osmLayer = L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            attribution: '© <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>'
+        });
+        const esriLayer = L.tileLayer('https://server.arcgisonline.com/ArcGIS/rest/services/World_Imagery/MapServer/tile/{z}/{y}/{x}', {
+            attribution: '© <a href="https://www.esri.com/">Esri</a>, i-cubed, USDA, USGS, AEX, GeoEye, Getmapping, Aerogrid, IGN, IGP, UPR-EGP, and the GIS User Community'
+        });
+        osmLayer.addTo(map); // Default basemap
+
+        // Initialize layer groups
+        const drawnItems = new L.FeatureGroup();
+        const errorLayers = new L.FeatureGroup();
+        const markerLayers = new L.FeatureGroup();
+        map.addLayer(drawnItems);
+        map.addLayer(errorLayers);
+        map.addLayer(markerLayers);
+
+        // Store uploaded GeoJSON data and layer names
+        let geojson1 = null;
+        let geojson2 = null;
+        let layerName1 = '';
+        let layerName2 = '';
+        const errorLayerBounds = [];
+
+        // Handle basemap switch
+        document.getElementById('basemap').addEventListener('change', function () {
+            const value = this.value;
+            map.eachLayer(layer => {
+                if (layer === osmLayer || layer === esriLayer) {
+                    map.removeLayer(layer);
+                }
+            });
+            if (value === 'osm') {
+                osmLayer.addTo(map);
+            } else {
+                esriLayer.addTo(map);
+            }
+        });
+
+        // Handle marker toggle
+        document.getElementById('toggleMarkers').addEventListener('change', function () {
+            if (this.checked) {
+                map.addLayer(markerLayers);
+            } else {
+                map.removeLayer(markerLayers);
+            }
+        });
+
+        // Handle file uploads
+        document.getElementById('file1').addEventListener('change', handleFileUpload);
+        document.getElementById('file2').addEventListener('change', handleFileUpload);
+
+        async function handleFileUpload(event) {
+            const file = event.target.files[0];
+            if (!file) return;
+
+            try {
+                let geojson;
+                let layerName = file.name.replace(/\.[^/.]+$/, '');
+                if (file.name.endsWith('.zip')) {
+                    const arrayBuffer = await file.arrayBuffer();
+                    geojson = await shp(arrayBuffer);
+                    geojson = geojson.type === 'FeatureCollection' ? geojson : { type: 'FeatureCollection', features: [geojson] };
+                    if (geojson.features[0]?.properties) {
+                        const props = geojson.features[0].properties;
+                        layerName = props.name || props.NAME || props.id || props.ID || layerName;
+                    }
+                } else if (file.name.endsWith('.geojson') || file.name.endsWith('.json')) {
+                    const text = await file.text();
+                    geojson = JSON.parse(text);
+                    if (geojson.features && geojson.features[0]?.properties) {
+                        const props = geojson.features[0].properties;
+                        layerName = props.name || props.NAME || props.id || props.ID || layerName;
+                    } else if (geojson.properties) {
+                        layerName = geojson.properties.name || geojson.properties.NAME || geojson.properties.id || geojson.properties.ID || layerName;
+                    }
+                } else {
+                    throw new Error('Unsupported file type');
+                }
+
+                if (event.target.id === 'file1') {
+                    geojson1 = geojson;
+                    layerName1 = layerName;
+                } else {
+                    geojson2 = geojson;
+                    layerName2 = layerName;
+                }
+                updateMap();
+                checkUploadStatus();
+            } catch (error) {
+                alert('Error processing file: ' + error.message);
+            }
+        }
+
+        // Enable/disable topology check button
+        function checkUploadStatus() {
+            document.getElementById('checkTopology').disabled = !(geojson1 && geojson2);
+        }
+
+        // Update map with uploaded GeoJSON and tooltips
+        function updateMap() {
+            drawnItems.clearLayers();
+            errorLayers.clearLayers();
+            markerLayers.clearLayers();
+            errorLayerBounds.length = 0;
+
+            function addGeoJSONWithTooltips(geojson, color, layerName) {
+                L.geoJSON(geojson, {
+                    style: { color: color, weight: 2, fillOpacity: 0.3 },
+                    onEachFeature: function (feature, layer) {
+                        let tooltipContent = `Layer: ${layerName}`;
+                        if (feature.properties) {
+                            const props = feature.properties;
+                            const featureName = props.name || props.NAME || props.id || props.ID || 'Unnamed Feature';
+                            tooltipContent += `<br>Feature: ${featureName}`;
+                        }
+                        layer.bindTooltip(tooltipContent, { sticky: true });
+                    }
+                }).addTo(drawnItems);
+            }
+
+            if (geojson1) {
+                addGeoJSONWithTooltips(geojson1, '#ff0000', layerName1);
+            }
+            if (geojson2) {
+                addGeoJSONWithTooltips(geojson2, '#0000ff', layerName2);
+            }
+            if (geojson1 || geojson2) {
+                map.fitBounds(drawnItems.getBounds());
+            }
+        }
+
+        // Clear map
+        document.getElementById('clearMap').addEventListener('click', function () {
+            drawnItems.clearLayers();
+            errorLayers.clearLayers();
+            markerLayers.clearLayers();
+            errorLayerBounds.length = 0;
+            geojson1 = null;
+            geojson2 = null;
+            layerName1 = '';
+            layerName2 = '';
+            document.getElementById('file1').value = '';
+            document.getElementById('file2').value = '';
+            document.getElementById('errorTableBody').innerHTML = '';
+            checkUploadStatus();
+        });
+
+        // Check topology
+        document.getElementById('checkTopology').addEventListener('click', function () {
+            const errorTableBody = document.getElementById('errorTableBody');
+            errorTableBody.innerHTML = '';
+            errorLayers.clearLayers();
+            markerLayers.clearLayers();
+            errorLayerBounds.length = 0;
+            const errors = [];
+
+            // Ensure both GeoJSONs are valid
+            if (!geojson1 || !geojson2) {
+                errorTableBody.innerHTML = '<tr><td colspan="4">Please upload both files</td></tr>';
+                return;
+            }
+
+            // Convert to Turf-compatible format
+            const features1 = geojson1.type === 'FeatureCollection' ? geojson1.features : [geojson1];
+            const features2 = geojson2.type === 'FeatureCollection' ? geojson2.features : [geojson2];
+            const allFeatures = [...features1, ...features2].filter(f => f.geometry.type.includes('Polygon'));
+
+            // Check for overlaps between layers
+            features1.forEach((f1, i) => {
+                features2.forEach((f2, j) => {
+                    if (f1.geometry.type.includes('Polygon') && f2.geometry.type.includes('Polygon')) {
+                        const name1 = f1.properties?.name || f1.properties?.NAME || f1.properties?.id || f1.properties?.ID || `Feature ${i + 1}`;
+                        const name2 = f2.properties?.name || f2.properties?.NAME || f2.properties?.id || f2.properties?.ID || `Feature ${j + 1}`;
+
+                        // Check for overlap
+                        const intersection = turf.intersect(f1, f2);
+                        if (intersection) {
+                            const area = turf.area(intersection).toFixed(2);
+                            errors.push({
+                                message: `Overlap detected between ${name1} in ${layerName1} and ${name2} in ${layerName2}`,
+                                area: area,
+                                geometry: intersection,
+                                type: 'Overlap'
+                            });
+                            const layer = L.geoJSON(intersection, {
+                                style: { color: '#00ff00', weight: 2, fillOpacity: 0.5 }
+                            }).addTo(errorLayers);
+                            errorLayerBounds.push(layer.getBounds());
+                        }
+                    }
+                });
+            });
+
+            // Check for gaps between layers using the outer boundary of the union
+            if (allFeatures.length > 1) {
+                let union = allFeatures[0];
+                for (let i = 1; i < allFeatures.length; i++) {
+                    union = turf.union(union, allFeatures[i]);
+                }
+
+                // Extract the outer boundary
+                let outerBoundary;
+                if (union.geometry.type === 'Polygon') {
+                    outerBoundary = {
+                        type: 'Feature',
+                        geometry: { type: 'Polygon', coordinates: [union.geometry.coordinates[0]] },
+                        properties: {}
+                    };
+                } else if (union.geometry.type === 'MultiPolygon') {
+                    outerBoundary = {
+                        type: 'Feature',
+                        geometry: {
+                            type: 'MultiPolygon',
+                            coordinates: union.geometry.coordinates.map(coords => [coords[0]])
+                        },
+                        properties: {}
+                    };
+                }
+
+                // Check for gaps (holes) within the union
+                if (union.geometry.type === 'Polygon' && union.geometry.coordinates.length > 1) {
+                    union.geometry.coordinates.slice(1).forEach((ring, index) => {
+                        const gap = {
+                            type: 'Feature',
+                            geometry: { type: 'Polygon', coordinates: [ring] },
+                            properties: {}
+                        };
+                        const area = turf.area(gap).toFixed(2);
+                        if (area > 0.01) {
+                            errors.push({
+                                message: `Gap (hole) detected between layers ${layerName1} and ${layerName2}`,
+                                area: area,
+                                geometry: gap,
+                                type: 'Gap'
+                            });
+                            const layer = L.geoJSON(gap, {
+                                style: { color: '#ffa500', weight: 2, fillOpacity: 0.5 }
+                            }).addTo(errorLayers);
+                            errorLayerBounds.push(layer.getBounds());
+                        }
+                    });
+                } else if (union.geometry.type === 'MultiPolygon') {
+                    union.geometry.coordinates.forEach((poly, polyIndex) => {
+                        if (poly.length > 1) {
+                            poly.slice(1).forEach((ring, ringIndex) => {
+                                const gap = {
+                                    type: 'Feature',
+                                    geometry: { type: 'Polygon', coordinates: [ring] },
+                                    properties: {}
+                                };
+                                const area = turf.area(gap).toFixed(2);
+                                if (area > 0.01) {
+                                    errors.push({
+                                        message: `Gap (hole) detected between layers ${layerName1} and ${layerName2}`,
+                                        area: area,
+                                        geometry: gap,
+                                        type: 'Gap'
+                                    });
+                                    const layer = L.geoJSON(gap, {
+                                        style: { color: '#ffa500', weight: 2, fillOpacity: 0.5 }
+                                    }).addTo(errorLayers);
+                                    errorLayerBounds.push(layer.getBounds());
+                                }
+                            });
+                        }
+                    });
+                }
+
+                // Check for additional gaps by differencing
+                let gaps = turf.difference(outerBoundary, union);
+                if (gaps && gaps.geometry.coordinates.length > 0) {
+                    const gapFeatures = gaps.geometry.type === 'MultiPolygon'
+                        ? gaps.geometry.coordinates.map(coords => ({
+                            type: 'Feature',
+                            geometry: { type: 'Polygon', coordinates: coords },
+                            properties: {}
+                        }))
+                        : [{ type: 'Feature', geometry: gaps.geometry, properties: {} }];
+
+                    gapFeatures.forEach((gap, index) => {
+                        const area = turf.area(gap).toFixed(2);
+                        if (area > 0.01) {
+                            errors.push({
+                                message: `Gap detected between layers ${layerName1} and ${layerName2}`,
+                                area: area,
+                                geometry: gap,
+                                type: 'Gap'
+                            });
+                            const layer = L.geoJSON(gap, {
+                                style: { color: '#ffa500', weight: 2, fillOpacity: 0.5 }
+                            }).addTo(errorLayers);
+                            errorLayerBounds.push(layer.getBounds());
+                        }
+                    });
+                }
+            }
+
+            // Check for holes and invalid geometries within each layer
+            [geojson1, geojson2].forEach((geojson, layerIndex) => {
+                const layerName = layerIndex === 0 ? layerName1 : layerName2;
+                const features = geojson.type === 'FeatureCollection' ? geojson.features : [geojson];
+                features.forEach((feature, i) => {
+                    if (feature.geometry.type.includes('Polygon')) {
+                        const name = feature.properties?.name || feature.properties?.NAME || feature.properties?.id || feature.properties?.ID || `Feature ${i + 1}`;
+
+                        // Check for holes (interior rings)
+                        const coords = feature.geometry.type === 'Polygon' ? [feature.geometry.coordinates] : feature.geometry.coordinates;
+                        coords.forEach((polyCoords, polyIndex) => {
+                            if (polyCoords.length > 1) {
+                                for (let ringIndex = 1; ringIndex < polyCoords.length; ringIndex++) {
+                                    const hole = {
+                                        type: 'Feature',
+                                        geometry: { type: 'Polygon', coordinates: [polyCoords[ringIndex]] },
+                                        properties: {}
+                                    };
+                                    const area = turf.area(hole).toFixed(2);
+                                    if (area > 0.01) {
+                                        errors.push({
+                                            message: `Hole detected in ${name} in ${layerName}`,
+                                            area: area,
+                                            geometry: hole,
+                                            type: 'Hole'
+                                        });
+                                        const layer = L.geoJSON(hole, {
+                                            style: { color: '#ffa500', weight: 2, fillOpacity: 0.5 }
+                                        }).addTo(errorLayers);
+                                        errorLayerBounds.push(layer.getBounds());
+                                    }
+                                }
+                            }
+                        });
+
+                        // Check for invalid geometries (self-intersections)
+                        const kinks = turf.kinks(feature);
+                        if (kinks.features.length > 0) {
+                            kinks.features.forEach((kink, kinkIndex) => {
+                                const area = turf.area(kink).toFixed(2);
+                                if (area > 0.01) {
+                                    errors.push({
+                                        message: `Invalid geometry (self-intersection) in ${name} in ${layerName}`,
+                                        area: area,
+                                        geometry: kink,
+                                        type: 'Invalid Geometry'
+                                    });
+                                    const layer = L.geoJSON(kink, {
+                                        style: { color: '#ffa500', weight: 2, fillOpacity: 0.5 }
+                                    }).addTo(errorLayers);
+                                    errorLayerBounds.push(layer.getBounds());
+                                }
+                            });
+                        }
+                    }
+                });
+            });
+
+            // Display errors in table and add circle markers
+            if (errors.length === 0) {
+                errorTableBody.innerHTML = '<tr><td colspan="4">No topology errors found</td></tr>';
+            } else {
+                errors.forEach((error, index) => {
+                    // Add table row
+                    const row = document.createElement('tr');
+                    row.innerHTML = `
+                        <td>${index + 1}</td>
+                        <td>${error.message}</td>
+                        <td>${error.area}</td>
+                        <td><button class="btn btn-sm btn-primary zoom-btn" data-index="${index}">Zoom</button></td>
+                    `;
+                    errorTableBody.appendChild(row);
+
+                    // Add circle marker
+                    const centroid = turf.centroid(error.geometry);
+                    const [lng, lat] = centroid.geometry.coordinates;
+                    const marker = L.marker([lat, lng], {
+                        icon: L.divIcon({
+                            className: 'circle-number',
+                            html: `${index + 1}`,
+                            iconSize: [24, 24]
+                        })
+                    }).addTo(markerLayers);
+                    const tooltipContent = `
+                        <b>Error #${index + 1}</b><br>
+                        Type: ${error.type}<br>
+                        ${error.message}<br>
+                        Area: ${error.area} sq m
+                    `;
+                    marker.bindTooltip(tooltipContent, { direction: 'top', offset: [0, -10] });
+                });
+            }
+
+            // Add zoom functionality to buttons
+            document.querySelectorAll('.zoom-btn').forEach(button => {
+                button.addEventListener('click', function () {
+                    const index = parseInt(this.getAttribute('data-index'));
+                    const bounds = errorLayerBounds[index];
+                    if (bounds) {
+                        map.fitBounds(bounds, { padding: [20, 20] });
+                    }
+                });
+            });
+        });
+    </script>
+</body>
+</html>
